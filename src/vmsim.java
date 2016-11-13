@@ -2,6 +2,8 @@ import java.io.FileNotFoundException;
 import java.util.Scanner;
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 
 public class vmsim {
@@ -9,8 +11,7 @@ public class vmsim {
 	//global contents of tracefile
 	static ArrayList<Long> addresses = new ArrayList<Long>();
 	static ArrayList<Character> modes = new ArrayList<Character>();
-	static PageTable pageTable = new PageTable();
-	static int frames;
+	static PageTable pageTable;
 	
 	public static void main(String[] args) {
 		//first parse command line input
@@ -34,47 +35,35 @@ public class vmsim {
 			addresses.add(getAddress(temp));
 			modes.add(getMode(temp));
 		}
-		int algo = 0;
+		String algo = "opt"; //get this from command line
+		int frames = 8; //get this from command line
+		
+		if (algo.equals("opt")) {
+			//only preprocess the tracefile if we are running opt
+			pageTable = new PageTable(frames, preprocess(), addresses);
+		}
+		else {
+			pageTable = new PageTable(frames, null, addresses);
+		}
+		int faults = 0;
+		int writes = 0;
+//		
 		for (int i = 0; i < addresses.size(); i++) {
-			if (pageTable.search(addresses.get(i)) == -1) {
-				//page fault
-				if (pageTable.add(addresses.get(i)) == 0) {
-					switch (algo) {
-					case 1:
-						opt();
-						break;
-					case 2:
-						clock();
-						break;
-					case 3:
-						aging();
-						break;
-					case 4:
-						workingSetClock();
-						break;
-					}
+			if (pageTable.search(addresses.get(i)) == -1) { //page fault
+				faults++;
+				if (pageTable.add(addresses.get(i), algo, i, modes.get(i))) { //try to add to page table
+					//System.out.println("added");
+					//stats
+					writes++;
 				}
 			} else {
-				//add to page table
+				//success, found the frame
 			}
+//			System.out.println(i);
+//			break;
 		}
-		
-	}
-	
-	public static void opt() {
-		HashMap<Integer, Integer> ranking = preprocess();
-		
-	}	
-
-	public static void clock() {
-		
-	}
-	
-	public static void aging() {
-		
-	}
-	
-	public static void workingSetClock() {
+		System.out.printf("Page Faults: %d.\n", faults);
+		System.out.printf("Writes to disk: %d.\n", writes);
 		
 	}
 	
@@ -123,8 +112,32 @@ class PageTable {
 	//1st level 
 	public SecondLevel[] table;
 	
-	public PageTable() {
+	//privates
+	private int frames;
+	/**
+	 * map page number to line number
+	 */
+	private HashMap<Integer, Integer> ranking; //map page number to line number
+	private ArrayList<Integer> framesAvailable;
+	private ArrayList<Long> addresses;
+	/**
+	 * map frame number to page number
+	 */
+	private HashMap<Integer, Integer> mainMemory; //map frame number to page number
+	
+	public PageTable(int maxframes, HashMap<Integer, Integer> rank, ArrayList<Long> adr) {
 		table = new SecondLevel[1024];
+		for (int i = 0; i < 1024; i++) {
+			table[i] = new SecondLevel();
+		}
+		frames = maxframes;
+		ranking = rank;
+		framesAvailable = new ArrayList<Integer>();
+		addresses = adr;
+		for (int i = 0; i < maxframes; i++) {
+			framesAvailable.add(i);
+		}
+		mainMemory = new HashMap<Integer, Integer>();
 	}
 	
 	/**
@@ -133,14 +146,16 @@ class PageTable {
 	 */
 	public int search(long adr) {
 		int frame = -1;
-		//mask the address to get the different addresses
-		long upperbits = (adr & 0x00000000ffc00000) >>> 22;
-		long lowerbits = (adr & 0x00000000003ff000) >>> 12;
-		//long offset =     adr & 0x0000000000000fff;
 		
-		SecondLevel second = table[(int)upperbits];
+		//mask the address to get the different addresses
+		adr = adr >>> 12;
+		int upperbits = (int) (adr & 0x00000000000ffc00);
+		upperbits = upperbits >>> 10;
+		int lowerbits = (int) (adr & 0x00000000000003ff);
+
+		SecondLevel second = table[upperbits];
 		if (second != null) {
-			PageTableEntry entry = second.table[(int)lowerbits];
+			PageTableEntry entry = second.table[lowerbits];
 			if (entry != null) {
 				//found the page in the page table
 				frame = entry.frameNumber;
@@ -150,14 +165,124 @@ class PageTable {
 	}
 	
 	/**
-	 * Add an address
+	 * Add an address. Run page replacement algorithm if necessary. 
 	 * @param adr
-	 * @return 0 for failure, nonzero for success
+	 * @return true if there was a write to disk, nonzero for success
 	 */
-	public int add(long adr) {
-		int retval = 0;
-		PageTableEntry newEntry = new PageTableEntry(0, false, false, false);
+	public boolean add(long adr, String algo, int currentLine, char mode) {
+		boolean retval = false;
+		int frame = 0;
+		if (framesAvailable.size() == 0) {
+			switch (algo) {
+			case "opt":
+				retval = opt(currentLine);
+				break;
+			case "clock":
+				clock();
+				break;
+			case "aging": 
+				aging();
+				break;
+			case "work":
+				workingSetClock();
+				break;
+			}
+		} else {
+			//look for a frame to use
+			frame = framesAvailable.get(0);
+//			System.out.println(frame);
+			framesAvailable.remove(0); //that frame is no longer available
+//			System.out.println(framesAvailable);
+			//make new entry
+			PageTableEntry newEntry = new PageTableEntry(frame, (mode == 'W'), true/*, false*/);
+			
+			//mask bits to get upper and lower indices
+			adr = adr >>> 12;
+			int upperbits = (int) (adr & 0x00000000000ffc00);
+			upperbits = upperbits >>> 10;
+			int lowerbits = (int) (adr & 0x00000000000003ff);
+			
+			SecondLevel second = table[upperbits];
+			if (second != null) {
+				//add it to the table
+				second.table[lowerbits] = newEntry;
+				mainMemory.put(frame, (int)adr);
+			}
+		}
+		
 		return retval;
+	}
+	
+	/**
+	 * 
+	 * @param currentLine
+	 * @return true if there was a write to disk
+	 */
+	public boolean opt(int currentLine) {
+		boolean retval = false;
+		/*Collection<Integer> values = ranking.values();
+		//search for largest number in values greater than currentLine
+		int max = currentLine;
+		for (int val : values) {
+			if (val > max) max = val;
+			//max should now be the line number of the farthest page use
+		}
+		
+		//get the address associated with that line
+		long adr = addresses.get(max);
+		*/
+		
+		//search through page table
+		
+		//find the page that isn't used until the latest
+		//get all pages that have a frame
+		Collection<Integer> pagenums = mainMemory.values();
+		//search those page numbers in ranking
+		int max = currentLine;
+		int cur = 0;
+		for (int p : pagenums) {
+			cur = ranking.get(p);
+//			System.out.println(cur);
+			if (cur > max) max = cur;
+			//max is the highest line number
+		}
+		
+		//special case where none of the pages in the page table are going to be used again in the future
+		if (max == currentLine) {
+			max = ranking.get(pagenums.toArray()[0]);
+		}
+		
+		long adr = addresses.get(max);
+		//now we know which address, shift to get page number
+		adr = adr >>> 12;
+//		adr is now the 20bit page number
+		
+		//evict that frame
+		int upperbits = (int) (adr & 0x00000000000ffc00);
+		upperbits = upperbits >>> 10;
+		int lowerbits = (int) (adr & 0x00000000000003ff);
+		
+		SecondLevel second = table[upperbits];
+		if (second != null) {
+			PageTableEntry entry = second.table[lowerbits];
+			retval = entry.dirty;
+			framesAvailable.add(entry.frameNumber);
+			mainMemory.remove(entry.frameNumber);
+			second.table[lowerbits] = null;
+		}
+		return retval;
+	}	
+
+	public void clock() {
+		
+	}
+	
+	public void aging() {
+		
+	}
+	
+	public void workingSetClock() {
+		
 	}
 }
 
@@ -173,6 +298,9 @@ class SecondLevel {
 	
 	public SecondLevel() {
 		table = new PageTableEntry[1024];
+		for (int i = 0; i < 1024; i++) {
+			table[i] = null;
+		}
 	}
 	
 }
@@ -189,7 +317,7 @@ class PageTableEntry {
 	public int frameNumber;
 	public boolean dirty;
 	public boolean referenced;
-	public boolean valid;
+	//public boolean valid;
 	
 	
 	/**
@@ -199,10 +327,10 @@ class PageTableEntry {
 	 * @param r
 	 * @param v
 	 */
-	public PageTableEntry(int f, boolean d, boolean r, boolean v) {
+	public PageTableEntry(int f, boolean d, boolean r/*, boolean v*/) {
 		frameNumber = f;
 		dirty = d;
 		referenced = r;
-		valid = v;
+		//valid = v;
 	}
 }
